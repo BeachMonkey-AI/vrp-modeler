@@ -484,6 +484,7 @@
       rsuUnvested: 192000,   // Total Rewards → Stock → Quick info → "Total unvested value"
       vestingUnlocked: false,  // Microsoft "rule of 65/55": age 55+ and 15+ yrs of service → unvested RSUs continue vesting after separation
       privateHealthMonthly: 3000, // out-of-pocket monthly premium for private (ACA/marketplace) coverage after employer/COBRA ends, until Medicare at 65
+      currentPortfolio: 500000,   // current retirement portfolio balance (401k + IRA + taxable brokerage)
     },
     assumptions: {
       realReturnPct: 4,
@@ -491,7 +492,13 @@
       ssStartAge: 67,
       retireSpending: 110000,      // net (after-tax) annual household spending in retirement
       bridgeSpendingPct: 70,       // % of retireSpending used during pre-retire age years when not working
+      savingsRateSalaryPct: 15,    // % of base pay assumed saved while working
+      savingsRateBonusPct: 40,     // % of annual bonus assumed saved
+      savingsRateRsuPct: 50,       // % of annual RSU vest assumed saved
+      reemploySalaryPct: 90,       // re-employment salary as % of current salary
+      gapLivingCostPct: 40,        // job-gap cost-of-living drawdown (% of salary, after tax)
     },
+
     offerPre: {
       cashMultipleX: 1.5,        // x salary
       cashOverride: 0,           // 0 = use multiple
@@ -500,6 +507,7 @@
       healthMonths: 12,
       cobraPaid: true,
       retirementBonus: 25000,
+      bonusPayout: 30000,        // annual bonus payout staff remain eligible for upon separation
       vestingMonths: 12,
       acceptanceMonthsFromNow: 1,  // "30-day acceptance" — separation occurs roughly this many months from today
     },
@@ -545,6 +553,27 @@
       if (parsed && parsed.assumptions && parsed.assumptions.bridgeSpendingPct === undefined) {
         parsed.assumptions.bridgeSpendingPct = 70;
       }
+      if (parsed && parsed.assumptions && parsed.assumptions.savingsRateSalaryPct === undefined) {
+        parsed.assumptions.savingsRateSalaryPct = 15;
+      }
+      if (parsed && parsed.assumptions && parsed.assumptions.savingsRateBonusPct === undefined) {
+        parsed.assumptions.savingsRateBonusPct = 40;
+      }
+      if (parsed && parsed.assumptions && parsed.assumptions.savingsRateRsuPct === undefined) {
+        parsed.assumptions.savingsRateRsuPct = 50;
+      }
+      if (parsed && parsed.assumptions && parsed.assumptions.reemploySalaryPct === undefined) {
+        parsed.assumptions.reemploySalaryPct = 90;
+      }
+      if (parsed && parsed.assumptions && parsed.assumptions.gapLivingCostPct === undefined) {
+        parsed.assumptions.gapLivingCostPct = 40;
+      }
+      if (parsed && parsed.profile && parsed.profile.currentPortfolio === undefined) {
+        parsed.profile.currentPortfolio = 500000;
+      }
+      if (parsed && parsed.offerPre && parsed.offerPre.bonusPayout === undefined) {
+        parsed.offerPre.bonusPayout = 30000;
+      }
       if (parsed && parsed.profile && parsed.profile.septBonus === undefined) {
         parsed.profile.septBonus = 20000;
       }
@@ -581,9 +610,11 @@
     // so they can never drift out of sync. The September bonus & RSU tranche are
     // discrete events handled separately by project(); they are excluded from this
     // smoothed annual savings number so we don't double-count them.
+    const rateSalary = (s.assumptions.savingsRateSalaryPct || 15) / 100;
+    const rateBonus  = (s.assumptions.savingsRateBonusPct  || 40) / 100;
     const bonusResidual = Math.max(0, (s.profile.bonusAmount || 0) - (s.profile.septBonus || 0));
-    return s.profile.salary * MODEL.SAVINGS_RATE_SALARY
-         + bonusResidual * MODEL.SAVINGS_RATE_BONUS;
+    return s.profile.salary * rateSalary
+         + bonusResidual * rateBonus;
   }
 
   // Fractional years from "today" until the September payout that lands in calendar year (currentYear + y).
@@ -662,11 +693,14 @@
       const { startCashAtSeparation = 0, separationYears = 0,
               workYears = 0, workSalary = s.profile.salary, gapYears = 0,
               employerHealthMonths = Infinity } = opts;
-      const reEmpAnnSave = workSalary * MODEL.SAVINGS_RATE_SALARY
-                        + (s.profile.septRsuVest || 0) * MODEL.SAVINGS_RATE_RSU * (workSalary / Math.max(1, s.profile.salary));
-      // Initial state at t = today. If separation happens at t=0, the lump is already in
-      // hand and visible at traj[0] so the chart shows an immediate jump.
-      let bal = (separationYears <= 0) ? startCashAtSeparation : 0;
+      const rateSalary = (s.assumptions.savingsRateSalaryPct || 15) / 100;
+      const rateRsu    = (s.assumptions.savingsRateRsuPct    || 50) / 100;
+      const reEmpAnnSave = workSalary * rateSalary
+                        + (s.profile.septRsuVest || 0) * rateRsu * (workSalary / Math.max(1, s.profile.salary));
+      // Initial state at t = today. Start from current portfolio balance.
+      // If separation happens at t=0, the lump is already in hand and visible at traj[0].
+      const startingPortfolio = s.profile.currentPortfolio || 0;
+      let bal = startingPortfolio + ((separationYears <= 0) ? startCashAtSeparation : 0);
       let lumpAdded = (separationYears <= 0);
       const out = [];
 
@@ -698,7 +732,8 @@
         if ((m + 1) / 12 > separationYears) {
           const tPost = Math.max(0, t - separationYears);
           if (tPost < gapYears) {
-            bal -= (s.profile.salary * MODEL.GAP_LIVING_COST_PCT * (1 - tax)) / 12;
+            const gapCostPct = (s.assumptions.gapLivingCostPct || 40) / 100;
+            bal -= (s.profile.salary * gapCostPct * (1 - tax)) / 12;
           } else if (tPost < gapYears + workYears) {
             bal += reEmpAnnSave / 12;
           } else {
@@ -716,8 +751,10 @@
           // Sept payout assumed at mid-month. Capture iff that point precedes separation.
           const septT = t + 0.5/12;
           if (septT < separationYears) {
-            bal += (s.profile.septBonus || 0) * MODEL.SAVINGS_RATE_BONUS;
-            bal += (s.profile.septRsuVest || 0) * MODEL.SAVINGS_RATE_RSU;
+            const rateBonus = (s.assumptions.savingsRateBonusPct || 40) / 100;
+            const rateRsu   = (s.assumptions.savingsRateRsuPct   || 50) / 100;
+            bal += (s.profile.septBonus || 0) * rateBonus;
+            bal += (s.profile.septRsuVest || 0) * rateRsu;
           }
         }
 
@@ -751,6 +788,7 @@
     // Clamp layoff start so it never lands after planned retirement.
     const layoffSeparationYears = Math.min(stayWorkYears, Math.max(0, (s.layoff.startMonthsFromNow || 0) / 12));
     const willReEmploy = s.layoff.reEmploy !== false;
+    const reemployPct = (s.assumptions.reemploySalaryPct || 90) / 100;
     const gap = willReEmploy ? ((s.layoff.timeToJobMonths || 0) / 12) : 0;
     const layoffPostSeparationYears = Math.max(0, stayWorkYears - layoffSeparationYears);
     const layoffWorkYears = willReEmploy ? Math.max(0, layoffPostSeparationYears - gap) : 0;
@@ -764,7 +802,7 @@
       startCashAtSeparation: sevNet,
       separationYears: layoffSeparationYears,
       workYears: layoffWorkYears,
-      workSalary: s.profile.salary * MODEL.REEMPLOY_SALARY_PCT,
+      workSalary: s.profile.salary * reemployPct,
       gapYears: gap,
       employerHealthMonths: layoffHealthMonths,
     });
@@ -784,7 +822,9 @@
     const vestingValue = s.profile.vestingUnlocked
       ? 0
       : (offerVestingMonths(s) / 12) * (s.profile.septRsuVest || 0);
-    const vrpStart = offerCashNet + vestingValue;
+    // Annual bonus payout staff remain eligible for (paid at separation, taxed).
+    const bonusPayoutNet = (s.offerPre.bonusPayout || 0) * (1 - tax);
+    const vrpStart = offerCashNet + vestingValue + bonusPayoutNet;
     // Acceptance window: VRP separation happens this far in the future. Lets the Sept
     // bonus/RSU lump be captured if separation lands after the next September date.
     const acceptanceMonths = s.offerPre.acceptanceMonthsFromNow || 0;
@@ -1003,6 +1043,10 @@
     body.appendChild(checkField('RSU vesting unlocked (rule of 55+15)?', () => p.vestingUnlocked, v => { p.vestingUnlocked = v; renderOffer(); },
       'At Microsoft (and many large tech employers), once you are at least age 55 AND have at least 15 years of service, your unvested RSUs continue to vest on schedule even after you leave — you do not forfeit them. Check this box if you qualify. When checked, the offer’s “vesting continuation months” field is ignored AND no extra credit is given to the VRP scenario for unvested stock, because you’d get those RSUs whether you take the offer or stay (it’s a wash).'));
 
+    body.appendChild(el('div', { class: 'sec' }, 'PORTFOLIO'));
+    body.appendChild(numberField('Current retirement portfolio ($)', () => p.currentPortfolio, v => p.currentPortfolio = Math.max(0, v), { step: 10000 },
+      'Your total invested retirement savings today — 401(k), IRA, Roth, taxable brokerage, etc. This is the starting balance for ALL three scenarios (STAY, LAYOFF, VRP). Does NOT include your home equity, unvested stock, or cash reserves. Check your brokerage/401(k) statements for the combined total.'));
+
     body.appendChild(el('div', { class: 'sec' }, 'HEALTH'));
     body.appendChild(numberField('Private health premium after term ($/mo)', () => p.privateHealthMonthly, v => p.privateHealthMonthly = v, { step: 100 },
       'Estimated out-of-pocket monthly premium you would pay for private (ACA marketplace or self-paid COBRA) coverage AFTER any employer-paid bridge ends, until Medicare kicks in at age 65. A family plan in your 50s/60s commonly runs $2,500\u20134,000/mo. This cost is subtracted from the VRP and Layoff scenarios for every month between the end of the offer\u2019s health bridge and age 65, and from the Stay scenario between planned retirement and age 65.'));
@@ -1019,12 +1063,29 @@
     body.appendChild(sliderField('Pre-retirement spending while not working (%)', () => a.bridgeSpendingPct, v => a.bridgeSpendingPct = v, 30, 100, 5, v => v.toFixed(0) + '%',
       'When the VRP or layoff (no-reemploy) scenario starts withdrawing BEFORE your planned retirement age, this is the % of full retirement spending used. Most early retirees temporarily reduce spending (no kids at home, no commute, deferred travel). Default 70%.'));
 
+    body.appendChild(el('div', { class: 'sec' }, 'INCOME & SAVINGS RATES'));
+    const incomeHint = el('div', { class: 'src-hint', html:
+      'Microsoft pays semi-monthly (1st & 15th). These sliders control what fraction of each income stream is assumed to reach your investment portfolio. ' +
+      'The remainder is assumed consumed by taxes + living expenses while employed. Adjust to match your actual savings behavior.'
+    });
+    body.appendChild(incomeHint);
+    body.appendChild(sliderField('Savings rate — base salary (%)', () => a.savingsRateSalaryPct, v => a.savingsRateSalaryPct = v, 0, 50, 1, v => v.toFixed(0) + '%',
+      'Percentage of your gross base salary that flows into long-term savings/investments each pay period. Microsoft pays 2×/month on the 1st and 15th. Default 15% — typical for someone maximizing 401(k) + ESPP + some after-tax savings. The remaining 85% is consumed by taxes, housing, and day-to-day expenses.'));
+    body.appendChild(sliderField('Savings rate — bonus (%)', () => a.savingsRateBonusPct, v => a.savingsRateBonusPct = v, 0, 80, 5, v => v.toFixed(0) + '%',
+      'Percentage of your annual bonus (including the September lump) that reaches your portfolio. Default 40% — bonuses are taxed at a high supplemental rate and people often spend some, but a good chunk typically gets invested.'));
+    body.appendChild(sliderField('Savings rate — RSU vests (%)', () => a.savingsRateRsuPct, v => a.savingsRateRsuPct = v, 0, 80, 5, v => v.toFixed(0) + '%',
+      'Percentage of RSU vest value (after tax withholding) that stays invested rather than being spent. Default 50% — most vest events auto-sell ~40% for taxes; this captures what you keep invested of the remainder.'));
+    body.appendChild(sliderField('Re-employment salary (% of current)', () => a.reemploySalaryPct, v => a.reemploySalaryPct = v, 50, 120, 5, v => v.toFixed(0) + '%',
+      'If laid off and re-employed, what salary would you realistically command? Default 90% — a modest haircut reflecting urgency and age bias in the market. Increase if you expect lateral or better offers; decrease for a competitive market.'));
+    body.appendChild(sliderField('Job-gap living cost (% of salary)', () => a.gapLivingCostPct, v => a.gapLivingCostPct = v, 20, 80, 5, v => v.toFixed(0) + '%',
+      'While between jobs (post-layoff, pre-reemploy), this % of your previous gross salary is drawn from savings to cover living expenses (after tax). Default 40% — covers essentials without the savings contributions you were making while employed.'));
+
     body.appendChild(el('div', { class: 'sec' }, 'LAYOFF BASELINE'));
     const maxLayoffStartMo = Math.max(0, Math.min(24, (state.profile.retireAge - state.profile.age) * 12));
     body.appendChild(sliderField('Layoff start (months from now)', () => Math.min(state.layoff.startMonthsFromNow || 0, maxLayoffStartMo), v => state.layoff.startMonthsFromNow = v, 0, Math.max(1, maxLayoffStartMo), 1, v => v.toFixed(0) + ' mo',
       'When the involuntary layoff is assumed to occur. Default is 0 \u2014 today \u2014 so the LAYOFF and VRP scenarios are directly comparable. Increase to model "what if I get laid off in N months." During the months before separation you stay employed at full salary and contributions. Capped at the years remaining until your planned retirement age.'));
     body.appendChild(checkField('Find new job after layoff?', () => state.layoff.reEmploy !== false, v => state.layoff.reEmploy = v,
-      'If checked, the model assumes you re-employ at 90% of current salary after the gap below, and continue working until your planned retirement age. If unchecked, the layoff is treated as immediate retirement \u2014 in that case LAYOFF and VRP are exactly comparable when severance/health terms match the offer.'));
+      'If checked, the model assumes you re-employ at the "Re-employment salary %" (above) after the gap below, and continue working until your planned retirement age. If unchecked, the layoff is treated as immediate retirement \u2014 in that case LAYOFF and VRP are exactly comparable when severance/health terms match the offer.'));
     body.appendChild(checkField('New employer covers health?', () => state.layoff.newEmployerHealth !== false, v => state.layoff.newEmployerHealth = v,
       'Only relevant if "Find new job after layoff?" is checked. If checked, assume the new employer\u2019s plan covers you for the remainder of the work years (no private premium drain). If unchecked, only the explicit "Health continuation (months)" applies and you pay the private premium for any uncovered months.'));
     body.appendChild(sliderField('Time to new job (months)', () => state.layoff.timeToJobMonths, v => state.layoff.timeToJobMonths = v, 0, 24, 1, v => v.toFixed(0) + ' mo',
@@ -1067,6 +1128,8 @@
         'If you want to test a specific dollar amount instead of a salary multiple, enter it here. Set to 0 to use the multiple/weeks formula.'));
       g1.appendChild(numberField('Additional retirement bonus ($)', () => o.retirementBonus, v => o.retirementBonus = v, { step: 1000 },
         'Optional one-time supplemental retirement contribution included in the hypothetical package (e.g., extra 401(k) or pension top-up).'));
+      g1.appendChild(numberField('Annual bonus payout ($)', () => o.bonusPayout, v => o.bonusPayout = Math.max(0, v), { step: 1000 },
+        'Staff taking the VRP typically remain eligible for their annual performance bonus (paid at or near separation). Enter the expected gross payout. Microsoft pays bonuses in September — this captures the portion you receive as part of the package. Taxed at your effective rate and added to VRP start cash.'));
       g1.appendChild(numberField('Weeks per year of service', () => o.weeksPerYear, v => o.weeksPerYear = v, {},
         'Weeks of pay added per year of service under the hypothetical formula (e.g., 2 weeks/yr is common in tech VRPs).'));
       g1.appendChild(numberField('Minimum weeks base', () => o.minWeeksBase, v => o.minWeeksBase = v, {},
